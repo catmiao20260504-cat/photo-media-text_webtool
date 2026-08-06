@@ -1,9 +1,9 @@
 // ==UserScript==
-// @name         网页 HTML 块级文本提取与下载器 (含实时搜索)
+// @name         网页 HTML 块级文本提取与下载器
 // @namespace    http://tampermonkey.net/
-// @version      1.2
+// @version      1.1
 // @description  按照 HTML 标签与块级节点自动辨识并提取网页中的文本块，提供文本搜索过滤、前20字预览、复制与txt单段/批量下载。
-// @author       You
+// @author       catmiao20260504
 // @match        *://*/*
 // @grant        GM_setClipboard
 // ==/UserScript==

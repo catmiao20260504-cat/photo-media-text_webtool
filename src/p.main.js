@@ -1,9 +1,9 @@
 // ==UserScript==
-// @name         网页图片提取与下载器 (长按多选+纯本地打包)
+// @name         网页图片提取与下载器
 // @namespace    http://tampermonkey.net/
-// @version      1.3
+// @version      1.1
 // @description  支持全端拖拽、双击隐藏、DOM动态监听。单击弹出快捷菜单，长按触发多选与纯本地ZIP打包下载。
-// @author       You
+// @author       catmiao20260504
 // @match        *://*/*
 // @grant        GM_download
 // @grant        GM_setClipboard

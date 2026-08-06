@@ -1,9 +1,9 @@
 // ==UserScript==
-// @name         网页音视频提取与下载器（Magic Bytes 智能识别）
+// @name         网页音视频提取与下载器
 // @namespace    http://tampermonkey.net/
-// @version      2.1
+// @version      1.1
 // @description  通过 Range 请求读取文件头智能识别 MP4/MKV/WebM/FLV/MP3/Ogg/WAV 等格式，无视后缀名限制，支持批量打包下载与在线预览。
-// @author       You
+// @author       catmiao20260504
 // @match        *://*/*
 // @grant        GM_download
 // @grant        GM_setClipboard
