@@ -1,134 +1,188 @@
 // ==UserScript==
-// @name         网页音视频提取与下载器 ( Magic Bytes 文件头智能识别 )
+// @name         网页音视频提取与下载器（Magic Bytes 智能识别）
 // @namespace    http://tampermonkey.net/
-// @version      2.0
-// @description  通过 Range 请求读取文件头 (Magic Bytes) 智能识别 MP4/MKV/WebM/FLV/MP3/Ogg 等格式，无视后缀名限制。
+// @version      2.1
+// @description  通过 Range 请求读取文件头智能识别 MP4/MKV/WebM/FLV/MP3/Ogg/WAV 等格式，无视后缀名限制，支持批量打包下载与在线预览。
 // @author       You
 // @match        *://*/*
 // @grant        GM_download
 // @grant        GM_setClipboard
 // @grant        GM_xmlhttpRequest
+// @connect      *
 // ==/UserScript==
 
 (function() {
     'use strict';
 
-    let mediaMap = new Map(); // url -> { type, format }
-    let testedUrls = new Set();
+    const CONCURRENCY = 4;            // 同时进行的探测请求数
+    const REQUEST_TIMEOUT = 6000;     // 单次探测超时（毫秒）
+    const SCAN_DEBOUNCE = 600;        // DOM 变化后的重新扫描防抖间隔
+    const NAV_EXT_BLACKLIST = ['html', 'htm', 'php', 'jsp', 'jspx', 'asp', 'aspx', 'action', 'shtml'];
+
+    let mediaMap = new Map();      // url -> { type, format }：已确认是媒体
+    let nonMediaUrls = new Set();  // 已探测、确认不是媒体，不再重复请求
+    let inFlight = new Set();      // 正在探测中，避免同一 URL 并发重复请求
     let selectedUrls = new Set();
     let isMultiSelectMode = false;
     let hlsInstance = null;
+    let hlsLoadPromise = null;
+
+    // ---------- 并发控制队列，避免链接较多的页面瞬间打出成百上千个请求 ----------
+    class RequestQueue {
+        constructor(max) { this.max = max; this.running = 0; this.queue = []; }
+        push(task) { this.queue.push(task); this._drain(); }
+        _drain() {
+            while (this.running < this.max && this.queue.length) {
+                const task = this.queue.shift();
+                this.running++;
+                Promise.resolve().then(task).catch(() => {}).finally(() => {
+                    this.running--;
+                    this._drain();
+                });
+            }
+        }
+    }
+    const probeQueue = new RequestQueue(CONCURRENCY);
 
     // 常用媒体文件头 Magic Bytes 匹配表
-    function detectFormatByHeader(uint8Array) {
-        if (uint8Array.length < 4) return null;
-
-        const hex = Array.from(uint8Array.slice(0, 16))
-            .map(b => b.toString(16).padStart(2, '0').toUpperCase())
-            .join(' ');
-
-        // MP4 (4-8字节为 ftyp)
-        if (uint8Array.length >= 8 && uint8Array[4] === 0x66 && uint8Array[5] === 0x74 && uint8Array[6] === 0x79 && uint8Array[7] === 0x70) {
+    function detectFormatByHeader(u) {
+        if (u.length < 4) return null;
+        if (u.length >= 8 && u[4] === 0x66 && u[5] === 0x74 && u[6] === 0x79 && u[7] === 0x70) {
             return { type: 'video', format: 'MP4' };
         }
-        // WebM / MKV (1A 45 DF A3)
-        if (uint8Array[0] === 0x1A && uint8Array[1] === 0x45 && uint8Array[2] === 0xDF && uint8Array[3] === 0xA3) {
+        if (u[0] === 0x1A && u[1] === 0x45 && u[2] === 0xDF && u[3] === 0xA3) {
             return { type: 'video', format: 'WebM/MKV' };
         }
-        // FLV (46 4C 56 / "FLV")
-        if (uint8Array[0] === 0x46 && uint8Array[1] === 0x4C && uint8Array[2] === 0x56) {
+        if (u[0] === 0x46 && u[1] === 0x4C && u[2] === 0x56) {
             return { type: 'video', format: 'FLV' };
         }
-        // Ogg / Ogv (4F 67 67 53 / "OggS")
-        if (uint8Array[0] === 0x4F && uint8Array[1] === 0x67 && uint8Array[2] === 0x67 && uint8Array[3] === 0x53) {
+        if (u[0] === 0x4F && u[1] === 0x67 && u[2] === 0x67 && u[3] === 0x53) {
             return { type: 'audio', format: 'Ogg' };
         }
-        // MP3 (ID3 标签: 49 44 33 或 帧头: FF FB / FF F3)
-        if ((uint8Array[0] === 0x49 && uint8Array[1] === 0x44 && uint8Array[2] === 0x33) ||
-            (uint8Array[0] === 0xFF && (uint8Array[1] & 0xE0) === 0xE0)) {
+        if ((u[0] === 0x49 && u[1] === 0x44 && u[2] === 0x33) || (u[0] === 0xFF && (u[1] & 0xE0) === 0xE0)) {
             return { type: 'audio', format: 'MP3' };
         }
-        // WAV (52 41 46 46 / "RIFF")
-        if (uint8Array[0] === 0x52 && uint8Array[1] === 0x49 && uint8Array[2] === 0x46 && uint8Array[3] === 0x46) {
+        if (u[0] === 0x52 && u[1] === 0x49 && u[2] === 0x46 && u[3] === 0x46) {
             return { type: 'audio', format: 'WAV' };
         }
-
         return null;
     }
 
-    // 零流量嗅探：只请求前 16 字节
-    function probeUrlHeader(url) {
-        if (testedUrls.has(url) || url.startsWith('javascript:') || url.startsWith('data:')) return;
-        testedUrls.add(url);
+    // 单次 GM_xmlhttpRequest 封装为 Promise，带超时
+    function gmProbe(url) {
+        return new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url,
+                headers: { 'Range': 'bytes=0-15' },
+                responseType: 'arraybuffer',
+                timeout: REQUEST_TIMEOUT,
+                onload: res => resolve(res),
+                onerror: () => reject(new Error('network')),
+                ontimeout: () => reject(new Error('timeout')),
+                onabort: () => reject(new Error('abort'))
+            });
+        });
+    }
 
-        // 如果是 m3u8，按文本特征/后缀判断
+    // fetch 兜底方案，用 AbortController 强制超时中断——
+    // 防止目标服务器不支持 Range 时把整个大文件下载下来
+    function fetchProbe(url) {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
+        return fetch(url, { headers: { 'Range': 'bytes=0-15' }, signal: controller.signal })
+            .then(res => res.arrayBuffer())
+            .finally(() => clearTimeout(timer));
+    }
+
+    // 零流量嗅探：只请求前 16 字节。探测结果分三种状态归档：
+    // 1) mediaMap：确认是媒体 2) nonMediaUrls：确认不是媒体，永久跳过
+    // 3) 网络错误/超时：不写入任何缓存，允许下次扫描重试
+    async function probeUrlHeader(url) {
+        if (mediaMap.has(url) || nonMediaUrls.has(url) || inFlight.has(url)) return;
+        if (url.startsWith('javascript:') || url.startsWith('data:')) return;
+
         if (url.includes('.m3u8')) {
             mediaMap.set(url, { type: 'video', format: 'M3U8' });
             updateBadge();
             return;
         }
 
-        const request = (typeof GM_xmlhttpRequest !== 'undefined') ? GM_xmlhttpRequest : fetch;
-
-        if (typeof GM_xmlhttpRequest !== 'undefined') {
-            GM_xmlhttpRequest({
-                method: 'GET',
-                url: url,
-                headers: { 'Range': 'bytes=0-15' },
-                responseType: 'arraybuffer',
-                onload: (res) => {
-                    if (res.status >= 200 && res.status < 300) {
-                        const buffer = new Uint8Array(res.response);
-                        const mediaInfo = detectFormatByHeader(buffer);
-                        if (mediaInfo) {
-                            mediaMap.set(url, mediaInfo);
-                            updateBadge();
-                        }
-                    }
+        inFlight.add(url);
+        probeQueue.push(async () => {
+            try {
+                let buffer;
+                if (typeof GM_xmlhttpRequest !== 'undefined') {
+                    const res = await gmProbe(url);
+                    if (res.status < 200 || res.status >= 300) throw new Error('status');
+                    buffer = new Uint8Array(res.response);
+                } else {
+                    buffer = new Uint8Array(await fetchProbe(url));
                 }
-            });
-        } else {
-            fetch(url, { headers: { 'Range': 'bytes=0-15' } })
-                .then(res => res.arrayBuffer())
-                .then(buffer => {
-                    const mediaInfo = detectFormatByHeader(new Uint8Array(buffer));
-                    if (mediaInfo) {
-                        mediaMap.set(url, mediaInfo);
-                        updateBadge();
-                    }
-                }).catch(() => {});
-        }
-    }
-
-    // 1. 遍历页面所有潜在链接并校验 Header
-    function scanAndProbeLinks() {
-        const candidateUrls = new Set();
-
-        // 收集所有 <a>, <source>, <video>, <audio> 链接
-        document.querySelectorAll('a[href], source[src], video[src], audio[src], video source, audio source').forEach(el => {
-            const src = el.href || el.src;
-            if (src) {
-                try {
-                    const fullUrl = new URL(src, document.baseURI).href;
-                    candidateUrls.add(fullUrl);
-                } catch(e){}
+                const info = detectFormatByHeader(buffer);
+                if (info) {
+                    mediaMap.set(url, info);
+                    updateBadge();
+                } else {
+                    nonMediaUrls.add(url);
+                }
+            } catch (e) {
+                // 失败不记录，留给下一轮扫描重试
+            } finally {
+                inFlight.delete(url);
             }
         });
-
-        // 逐一探测文件头（只异步请求前 16 字节）
-        candidateUrls.forEach(url => probeUrlHeader(url));
     }
 
-    // 动态加载 hls.js
-    function loadHlsLibrary(callback) {
-        if (typeof Hls !== 'undefined') {
-            if (callback) callback();
-            return;
+    // 粗筛掉明显是站内导航的链接（纯锚点、常见页面后缀、同域无后缀路径），
+    // 减少对普通 <a> 标签的无谓探测；video/audio/source 元素不受此限制
+    function isLikelyNavLink(urlStr) {
+        try {
+            const u = new URL(urlStr);
+            if (u.hash && u.pathname + u.search === location.pathname + location.search) return true;
+            const ext = u.pathname.includes('.') ? u.pathname.split('.').pop().toLowerCase() : '';
+            const hasExt = ext.length > 0 && ext.length <= 5;
+            if (u.hostname === location.hostname && (!hasExt || NAV_EXT_BLACKLIST.includes(ext))) return true;
+            return false;
+        } catch (e) {
+            return true;
         }
-        const script = document.createElement('script');
-        script.src = 'https://cdn.jsdelivr.net/npm/hls.js@latest';
-        script.onload = () => { if (callback) callback(); };
-        document.head.appendChild(script);
+    }
+
+    // 遍历页面所有潜在链接并校验 Header
+    function scanAndProbeLinks() {
+        const candidates = new Set();
+
+        document.querySelectorAll('video[src], audio[src], video source, audio source').forEach(el => {
+            const src = el.src;
+            if (!src) return;
+            try { candidates.add(new URL(src, document.baseURI).href); } catch (e) {}
+        });
+
+        document.querySelectorAll('a[href], source[src]').forEach(el => {
+            const src = el.href || el.src;
+            if (!src) return;
+            try {
+                const full = new URL(src, document.baseURI).href;
+                if (!isLikelyNavLink(full)) candidates.add(full);
+            } catch (e) {}
+        });
+
+        candidates.forEach(url => probeUrlHeader(url));
+    }
+
+    // 动态加载 hls.js：用 Promise 缓存加载状态，避免短时间内重复播放 m3u8 时重复插入 <script>
+    function loadHlsLibrary() {
+        if (typeof Hls !== 'undefined') return Promise.resolve();
+        if (hlsLoadPromise) return hlsLoadPromise;
+        hlsLoadPromise = new Promise((resolve, reject) => {
+            const script = document.createElement('script');
+            script.src = 'https://cdn.jsdelivr.net/npm/hls.js@latest';
+            script.onload = resolve;
+            script.onerror = () => { hlsLoadPromise = null; reject(new Error('hls.js 加载失败')); };
+            document.head.appendChild(script);
+        });
+        return hlsLoadPromise;
     }
 
     // 纯本地 Zip 打包
@@ -217,7 +271,7 @@
         }
     }
 
-    // 2. 样式设置
+    // 样式设置
     const style = document.createElement('style');
     style.textContent = `
         #media-fetcher-btn {
@@ -319,13 +373,13 @@
     modal.innerHTML = `
         <div id="media-fetcher-content">
             <div class="media-fetcher-header">
-                <span>网页音视频提取 (Header校验版: <span id="media-fetcher-modal-count">0</span>)</span>
+                <span>媒体提取器（共 <span id="media-fetcher-modal-count">0</span> 项）</span>
                 <button id="media-fetcher-close" style="border:none;background:none;font-size:20px;cursor:pointer;">&times;</button>
             </div>
             <div class="media-fetcher-toolbar" id="media-fetcher-toolbar">
                 <button class="media-fetcher-btn-action" id="btn-media-select-all">全选</button>
                 <button class="media-fetcher-btn-action" id="btn-media-invert-select">反选</button>
-                <button class="media-fetcher-btn-action" id="btn-media-download-selected" style="background:#e63946;">打包下载选中项</button>
+                <button class="media-fetcher-btn-action" id="btn-media-download-selected" style="background:#e63946;">打包下载</button>
                 <button class="media-fetcher-btn-action" id="btn-media-cancel-multiselect" style="background:#666;">退出多选</button>
                 <span id="media-selected-count-text" style="color:#666; margin-left:auto;">已选 0 项</span>
             </div>
@@ -338,9 +392,9 @@
     const menu = document.createElement('div');
     menu.id = 'media-fetcher-menu';
     menu.innerHTML = `
-        <div class="media-fetcher-menu-item" id="menu-media-download">a. 下载文件</div>
-        <div class="media-fetcher-menu-item" id="menu-media-copy">b. 复制链接</div>
-        <div class="media-fetcher-menu-item" id="menu-media-play" style="color:#1d3557;font-weight:bold;">c. 预览播放</div>
+        <div class="media-fetcher-menu-item" id="menu-media-download">下载文件</div>
+        <div class="media-fetcher-menu-item" id="menu-media-copy">复制链接</div>
+        <div class="media-fetcher-menu-item" id="menu-media-play" style="color:#1d3557;font-weight:bold;">预览播放</div>
     `;
     document.body.appendChild(menu);
 
@@ -554,7 +608,7 @@
     // 纯本地 ZIP 打包
     document.getElementById('btn-media-download-selected').addEventListener('click', async () => {
         if (selectedUrls.size === 0) {
-            alert('请先勾选需要打包的资源！');
+            alert('请先选择要打包的文件');
             return;
         }
 
@@ -588,13 +642,11 @@
             a.download = `media_batch_${Date.now()}.zip`;
             a.click();
             URL.revokeObjectURL(a.href);
-            btnDownload.innerText = originalText;
-            btnDownload.disabled = false;
         } else {
-            alert('所选资源下载失败（可能受 CORS 跨域限制或流媒体加密）。');
-            btnDownload.innerText = originalText;
-            btnDownload.disabled = false;
+            alert('下载失败，可能是跨域限制或流媒体加密');
         }
+        btnDownload.innerText = originalText;
+        btnDownload.disabled = false;
     });
 
     // 快捷菜单交互
@@ -620,14 +672,14 @@
         } else {
             navigator.clipboard.writeText(activeUrl);
         }
-        alert('链接已复制到剪贴板！');
+        alert('已复制链接');
         menu.style.display = 'none';
     });
 
     document.getElementById('menu-media-play').addEventListener('click', () => {
         if (!activeUrl) return;
         menu.style.display = 'none';
-        
+
         const video = document.getElementById('media-player-video');
         playerModal.style.display = 'flex';
 
@@ -639,7 +691,7 @@
         const info = mediaMap.get(activeUrl);
 
         if (info && info.format === 'M3U8') {
-            loadHlsLibrary(() => {
+            loadHlsLibrary().then(() => {
                 if (Hls.isSupported()) {
                     hlsInstance = new Hls();
                     hlsInstance.loadSource(activeUrl);
@@ -649,9 +701,9 @@
                     video.src = activeUrl;
                     video.play();
                 } else {
-                    alert('当前浏览器不支持 hls.js 播放！');
+                    alert('当前浏览器不支持播放此格式');
                 }
-            });
+            }).catch(() => alert('播放组件加载失败，请检查网络'));
         } else {
             video.src = activeUrl;
             video.play();
@@ -676,12 +728,15 @@
     document.getElementById('media-fetcher-close').addEventListener('click', () => { modal.style.display = 'none'; });
     modal.addEventListener('click', (e) => { if (e.target === modal) modal.style.display = 'none'; });
 
-    // 初始化
+    // 初始化：hls.js 改为播放时按需加载，不再随页面无条件注入
     window.addEventListener('load', () => {
         scanAndProbeLinks();
-        loadHlsLibrary();
 
-        const observer = new MutationObserver(() => scanAndProbeLinks());
+        let scanTimer = null;
+        const observer = new MutationObserver(() => {
+            clearTimeout(scanTimer);
+            scanTimer = setTimeout(scanAndProbeLinks, SCAN_DEBOUNCE);
+        });
         observer.observe(document.body, { childList: true, subtree: true });
     });
 })();
